@@ -54,6 +54,7 @@ ENV/
 *.key
 secrets.json
 credentials.json
+.pypirc
 
 # =============================================================================
 # IDE and editor metadata
