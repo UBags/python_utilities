@@ -16,7 +16,48 @@
 
 ## 💡 Real-World Power Examples
 
-### Example 1: Bulletproof External API Client
+### Example 1: Bulletproof Payment Charging (the headline stack)
+
+This is the kind of decorator stack you build a payments library for. One function, six declarative decorators, and the ten payment requirements stop being a checklist and start being something the type checker can read:
+
+```python
+from datetime import timedelta
+from python_utilities.decorators import (
+    retry, circuit_breaker, rate_limit, timer, log_execution,
+)
+from payments import idempotent, InMemoryIdempotencyStore, NetworkError
+
+idempotency_store = InMemoryIdempotencyStore()  # In production: Redis-backed.
+gateway = ...  # Your PaymentGateway adapter (Stripe, Adyen, etc.)
+
+@idempotent(idempotency_store, payload_arg="charge_request", ttl_seconds=86400)
+@circuit_breaker(failure_threshold=5, recovery_timeout=30.0)
+@retry(max_attempts=3, delay=0.5, backoff=2.0, exceptions=(NetworkError,))
+@rate_limit(max_calls=100, period=timedelta(minutes=1))
+@timer(metric_name="charge_duration")
+@log_execution(log_args=True, log_result=True)
+def charge_customer(charge_request: dict, idempotency_key: str) -> dict:
+    return gateway.authorize(...)
+```
+
+**The order is the point.** `@idempotent` is outermost: a duplicate request returns the cached result and skips everything below. That is *also* what makes `@retry` underneath it safe — a retried network failure won't double-charge, because the second attempt hits the same idempotency record. Reverse them and you get the exact failure mode payments engineering exists to prevent.
+
+What each layer adds:
+
+| Layer | Purpose | Failure mode prevented |
+|---|---|---|
+| `@idempotent` | Dedups on `Idempotency-Key`; rejects mismatched payloads on key reuse | Duplicate charges from client retries / browser refresh / network timeouts |
+| `@circuit_breaker` | Opens after repeated gateway failures; fails fast for `recovery_timeout` | Cascading failure when the gateway is down |
+| `@retry` | Exponential backoff on `NetworkError` only — never on `CardDeclinedError` | Transient blips causing real declines |
+| `@rate_limit` | Caps outbound calls per window | Card-testing attacks; gateway TPS overage fees |
+| `@timer` | Emits a duration metric | SLO blindness |
+| `@log_execution` | Audit trail of every charge attempt | Disputes that can't be reconstructed (PCI redaction filter scrubs the output) |
+
+See the [Payments Subpackage](#payments-subpackage) section below for the package layout, every module, and a full e-commerce checkout that wires this together with a Saga, fraud screening, webhook handling, and reconciliation.
+
+---
+
+### Example 2: Bulletproof External API Client
 ```python
 from python_utilities.decorators import retry, circuit_breaker, rate_limit, cached
 from datetime import timedelta
@@ -36,7 +77,7 @@ async def fetch_external_api(endpoint: str):
     return await http_client.get(f"https://api.example.com/{endpoint}")
 ```
 
-### Example 2: High-Throughput Background Job Processor
+### Example 3: High-Throughput Background Job Processor
 ```python
 from python_utilities.async_utils import AsyncQueue, AsyncBatchProcessor
 from python_utilities.decorators import timer, log_execution
@@ -65,7 +106,7 @@ batch_processor = AsyncBatchProcessor(
 )
 ```
 
-### Example 3: Event-Driven Microservice with Clean Architecture
+### Example 4: Event-Driven Microservice with Clean Architecture
 ```python
 from python_utilities.patterns import Repository, UnitOfWork, EventBus, Event
 from python_utilities.dependency_injection import DIContainer, Lifecycle
@@ -128,6 +169,301 @@ container.register(OrderService, OrderService)
 # Auto-resolves all dependencies!
 order_service = container.resolve(OrderService)
 ```
+
+---
+
+# Payments Subpackage
+
+The `payments/` subpackage provides production primitives for payment systems built on top of `python_utilities`. It is gateway-agnostic — bring your own Stripe / Adyen / Braintree adapter — and it is composable with every decorator and pattern from the rest of this library.
+
+It exists because **a payments system is not just an HTTP client to a gateway**. The hard parts are idempotency, distributed transaction consistency, signature verification, fraud screening, log redaction, and end-of-day reconciliation. Each of those is a module here.
+
+## Why a separate package
+
+Generic decorators like `@retry` and `@cached` are not enough on their own. `@cached` does not enforce idempotency (it doesn't reject mismatched payloads on key reuse, and it isn't durable across restarts). `@retry` is *unsafe* in front of a payment endpoint *unless* something further out enforces idempotency — otherwise a transient timeout becomes a duplicate charge. The `payments` subpackage supplies the missing primitives that make the existing decorators safe to use against money.
+
+## Module layout
+
+```
+payments/
+├── __init__.py           # public exports
+├── errors.py             # typed PaymentError hierarchy with `retriable` flag
+├── idempotency.py        # @idempotent decorator + pluggable store
+├── saga.py               # Saga orchestrator with compensations
+├── webhooks.py           # HMAC verifier, replay window, dedup helper
+├── redaction.py          # PCI-aware log filter + Tokenizer interface
+├── fraud.py              # Composable rule engine
+├── reconciliation.py     # Internal-ledger ↔ gateway-report comparator
+└── gateway.py            # Abstract PaymentGateway Protocol
+```
+
+| Module | Responsibility | Key public API |
+|---|---|---|
+| `errors` | Typed exception taxonomy that drives retry vs compensate decisions | `PaymentError`, `NetworkError`, `CardDeclinedError`, `FraudBlockedError`, `IdempotencyConflictError`, `SagaCompensationError` |
+| `idempotency` | Deduplicate retries; persist results across attempts | `@idempotent`, `IdempotencyStore`, `InMemoryIdempotencyStore`, `hash_payload` |
+| `saga` | Run multi-step transactions with compensation on failure | `Saga`, `SagaState`, `SagaExecution`, `assert_saga_succeeded` |
+| `webhooks` | Verify gateway callbacks; reject replays and duplicates | `WebhookVerifier`, `is_first_delivery`, `InMemoryDedupStore` |
+| `redaction` | Scrub PAN/CVV/track data from logs; tokenize PANs | `redact()`, `PCIRedactionFilter`, `EphemeralTokenizer`, `install_root_redaction_filter()` |
+| `fraud` | Pre-charge rule engine: AVS/CVV, velocity, blocklist, country, amount | `FraudEngine`, `FraudContext`, `Decision`, `velocity_rule`, `avs_cvv_rule` |
+| `reconciliation` | Daily comparison of internal ledger vs gateway report | `Reconciler`, `Discrepancy`, `DiscrepancyType`, `TransactionRecord` |
+| `gateway` | Abstract Protocol so business code is gateway-agnostic | `PaymentGateway`, `ChargeRequest`, `ChargeResult`, `RefundRequest` |
+
+## Mapping to the ten payment requirements
+
+| Requirement | Where it lives |
+|---|---|
+| 1. Idempotency for all payment operations | `idempotency.py` — `@idempotent` with durable store + payload hashing |
+| 2. PCI DSS scope reduction | `redaction.py` (filter) + `gateway.py` (tokens-only API surface) |
+| 3. Tokenization + data minimization | `redaction.Tokenizer` Protocol + `EphemeralTokenizer` for tests |
+| 4. Encryption in transit / at rest | Deployment concern; this package never touches raw PANs |
+| 5. Layered fraud prevention | `fraud.py` — composable rules + risk scoring |
+| 6. SCA / regulatory compliance | `fraud.py` raises `AuthenticationRequiredError` to trigger 3DS step-up |
+| 7. Distributed transaction consistency | `saga.py` — orchestrator + compensations + durable log hook |
+| 8. Logging, auditing, reconciliation | `redaction.py` (audit-safe logs) + `reconciliation.py` |
+| 9. Secure webhook handling | `webhooks.py` — HMAC + replay window + event-ID dedup |
+| 10. Resilience & rate limiting | Composes with existing `@retry`, `@circuit_breaker`, `@rate_limit` |
+
+## Idempotency
+
+Every payment endpoint must be idempotent. The pattern: client sends an `Idempotency-Key` header; server hashes the request payload and stores `(key, payload_hash, state, result)` in a durable store. Subsequent retries with the same key+payload return the stored result without re-executing.
+
+```python
+from payments import idempotent, InMemoryIdempotencyStore
+
+store = InMemoryIdempotencyStore()  # In production: Redis-backed.
+
+@idempotent(store, payload_arg="charge_request", ttl_seconds=86400)
+def create_charge(charge_request: dict, idempotency_key: str) -> dict:
+    return gateway.authorize(**charge_request)
+
+# First call: processes and stores result.
+r1 = create_charge(charge_request={"amount": 100, "card": "tok_x"},
+                   idempotency_key="abc-123")
+# Same key + same payload -> returns cached result, no re-call.
+r2 = create_charge(charge_request={"amount": 100, "card": "tok_x"},
+                   idempotency_key="abc-123")
+assert r1 == r2  # same charge_id
+
+# Same key + DIFFERENT payload -> IdempotencyConflictError (hard 4xx).
+create_charge(charge_request={"amount": 200, "card": "tok_x"},
+              idempotency_key="abc-123")  # raises
+```
+
+State machine inside the store: `IN_FLIGHT → COMPLETED` (or `→ FAILED` for terminal errors like `CardDeclinedError`). Replays of a `FAILED` key re-raise the original error rather than retrying — the caller already asked for this exact operation and got their answer. Retriable errors clear the slot so the client *can* retry.
+
+The `IdempotencyStore` interface is two atomic operations: `set_if_absent` and `update`. In Redis that's `SET key value NX EX <ttl>`; in PostgreSQL it's an `INSERT ... ON CONFLICT DO NOTHING` with a row-level update.
+
+## Saga orchestration
+
+When a checkout spans multiple services (inventory, payments, shipping), there is no ACID transaction that covers all of them. The Saga pattern replaces that with a sequence of local transactions, each paired with a compensating action that undoes it. If step N fails, steps N-1 down to 1 are compensated in reverse order.
+
+```python
+from payments import Saga, SagaState, InMemorySagaLog, assert_saga_succeeded
+
+saga = Saga(name="checkout", log=InMemorySagaLog())
+saga.add_step("reserve_inventory", inventory.reserve, compensate=inventory.release)
+saga.add_step("authorize_payment", payments.authorize, compensate=payments.void)
+saga.add_step("capture_payment",   payments.capture)   # no compensation needed
+saga.add_step("create_shipment",   shipping.create)    # final step
+
+execution = await saga.execute({"order_id": "ord_123", "amount": 5000})
+
+if execution.state == SagaState.COMPLETED:
+    return execution.context  # success
+elif execution.state == SagaState.COMPENSATED:
+    return error_response("Order failed; charges reversed.")
+elif execution.state == SagaState.FAILED_COMPENSATION:
+    page_oncall(execution)  # the worst case — manual reconciliation needed
+```
+
+Compensations themselves can fail. The orchestrator retries each compensation up to `compensation_retries` times with linear backoff. If a compensation still fails, the saga ends in `FAILED_COMPENSATION` and `SagaCompensationError` is raised by `assert_saga_succeeded()` — this is a page-the-on-call event because the system is now in an inconsistent state.
+
+The `SagaLog` Protocol records every state transition so a recovery process can resume in-flight sagas after a crash. Combine with `@idempotent` on the underlying step functions — that's what makes resumption safe.
+
+## Webhook verification
+
+Webhooks must be verified or an attacker who knows your endpoint URL can forge events and trigger fulfillment without paying. Three independent guarantees:
+
+```python
+from payments import WebhookVerifier, InMemoryDedupStore, is_first_delivery
+
+verifier = WebhookVerifier(
+    secret=os.environ["STRIPE_WEBHOOK_SECRET"],
+    replay_window_seconds=300,
+)
+dedup = InMemoryDedupStore()  # In production: Redis with TTL.
+
+def handle_webhook(raw_body: bytes, signature_header: str) -> int:
+    # 1. Authenticity: HMAC-SHA256 against shared secret.
+    # 2. Freshness: timestamp must be within replay_window_seconds.
+    try:
+        verifier.verify(raw_body, signature_header)
+    except (WebhookSignatureError, WebhookReplayError):
+        return 400
+
+    # 3. At-most-once: dedup on the gateway-provided event ID.
+    event = json.loads(raw_body)
+    if not is_first_delivery(event["id"], dedup):
+        return 200  # already processed; ack so gateway stops retrying
+
+    process_event(event)
+    return 200
+```
+
+**Always verify against the raw request body, not a re-serialized JSON.** Even one byte of difference (whitespace, key reordering by your framework's JSON middleware) breaks HMAC. Capture the body before any parsing layer runs.
+
+The signature scheme follows Stripe's convention (`t=<timestamp>,v1=<sig>`); multiple `v1=` entries are accepted to support secret rotation. Adapt the verifier for other gateways by parameterizing the parser.
+
+## PCI-aware log redaction
+
+Logs are the silent PCI violation. One log line containing a card number puts your entire log infrastructure — and everyone who can read it — in scope. The `PCIRedactionFilter` is your second line of defense for when a card number escapes into a log call:
+
+```python
+from payments import install_root_redaction_filter
+import logging
+
+logging.basicConfig(level=logging.INFO)
+install_root_redaction_filter()  # Attaches filter to every root handler.
+
+logger = logging.getLogger(__name__)
+logger.info("Customer support note: card 4111-1111-1111-1111 cvv: 999 was used")
+# Logged as: "Customer support note: card ************1111 cvv: [REDACTED_CVV] was used"
+```
+
+What gets redacted: PANs (13–19 digit sequences passing a Luhn check, with space/dash tolerance), labelled CVV/CVC fields, Track 1/2 magnetic stripe data. What does *not* get redacted: card brands, last-4 in isolation, expiry dates — these are routinely needed for support and aren't sensitive authentication data under PCI DSS.
+
+The first line of defense is to never let raw PANs into your servers in the first place — use a tokenization gateway (Stripe Elements, Adyen Hosted Fields) so PANs go directly from the user's browser to the vault. The `Tokenizer` Protocol is the seam your gateway adapter implements.
+
+## Fraud rule engine
+
+Composable rules, evaluated in order, short-circuiting on the first `BLOCK`:
+
+```python
+from payments import (
+    FraudEngine, FraudContext, Decision, VelocityTracker,
+    avs_cvv_rule, velocity_rule, country_mismatch_rule,
+    high_amount_rule, blocklist_rule,
+)
+
+tracker = VelocityTracker()
+engine = FraudEngine(rules=[
+    blocklist_rule(blocked_emails=load_blocklist()),
+    avs_cvv_rule(),                          # hard block on CVV/AVS mismatch
+    velocity_rule(tracker, key_fn=lambda c: c.user_id,
+                  max_count=5, window_seconds=3600,
+                  rule_name="user_hourly"),
+    country_mismatch_rule(),                  # challenge, don't block
+    high_amount_rule(threshold=2000.0),       # 3DS step-up over $2k
+], review_threshold=50)
+
+result = engine.evaluate(FraudContext(
+    user_id="u_42", email=order.email, amount=order.total,
+    avs_result=auth.avs, cvv_result=auth.cvv,
+    card_country="US", billing_country="US",
+))
+
+if result.decision == Decision.BLOCK:
+    raise FraudBlockedError(f"Blocked by {result.blocked_by}")
+elif result.decision == Decision.CHALLENGE:
+    return redirect_to_3ds(...)
+elif result.decision == Decision.REVIEW:
+    flag_for_human_review(order, result)
+# else APPROVE
+```
+
+Every rule's verdict is captured on the result so you can audit decisions, train models, and tune thresholds against historical data. New rules go behind a feature flag; the engine accepts any callable matching the `Rule` signature.
+
+## Daily reconciliation
+
+Even with idempotency, sagas, and verified webhooks, drift happens. A webhook acked but never persisted, a refund issued through the gateway dashboard, a settlement-currency rounding difference — they create gaps between what your DB believes and what the gateway recorded. Reconciliation catches them before they become a finance audit finding:
+
+```python
+from payments import Reconciler, TransactionRecord, DiscrepancyType
+from decimal import Decimal
+
+reconciler = Reconciler()
+reconciler.on(DiscrepancyType.MISSING_GATEWAY, page_oncall)
+reconciler.on(DiscrepancyType.MISSING_INTERNAL, replay_from_webhook_archive)
+
+report = reconciler.reconcile(
+    internal=ledger.list_transactions(yesterday),
+    gateway=stripe_client.list_balance_transactions(yesterday),
+)
+logger.info(report.summary())
+# "1248/1251 matched, 3 discrepancies: 2 missing_internal, 1 status_mismatch"
+```
+
+Discrepancy taxonomy: `MISSING_INTERNAL` (gateway has it, you don't — usually a missed webhook), `MISSING_GATEWAY` (you think it succeeded, gateway doesn't know — almost always a bug), `AMOUNT_MISMATCH`, `STATUS_MISMATCH`. Run against T-1 data — settlement and webhook delivery have lag.
+
+`Decimal` (not `float`) for amounts: cents are exact in `Decimal` and floats accumulate rounding error that compounds across thousands of transactions.
+
+## Typed errors that drive control flow
+
+The `retriable` flag on `PaymentError` is what lets the rest of the package make correct decisions automatically:
+
+```python
+from payments import (
+    NetworkError,            # retriable=True  -> @retry catches it
+    GatewayTimeoutError,     # retriable=True  -> charge state UNKNOWN; reconcile
+    RateLimitedError,        # retriable=True  -> back off
+    CardDeclinedError,       # retriable=False -> surface to user, don't retry
+    InsufficientFundsError,  # retriable=False
+    FraudBlockedError,       # retriable=False -> compensate, don't retry
+    AuthenticationRequiredError,  # retriable=False -> 3DS step-up
+)
+
+@retry(max_attempts=3, exceptions=(NetworkError, GatewayTimeoutError))
+def charge(...):  # Only retries the right errors. Card declines fail fast.
+    ...
+```
+
+`@idempotent` consults `retriable` too: it persists terminal failures (so a replayed key re-raises the same decline) but clears retriable failures (so the client *can* retry).
+
+## Full e-commerce checkout example
+
+The `ecommerce_checkout_example.py` ships with the package and runs end-to-end. It composes everything above plus the existing `python_utilities` decorators, demonstrating seven scenarios:
+
+1. **Successful checkout with transient failure** — `@retry` recovers from two `NetworkError`s, saga completes.
+2. **Idempotent replay** — same key + same payload returns cached charge, no second gateway call.
+3. **Saga compensation** — shipment fails after authorize+capture; payment is voided and inventory released in reverse order.
+4. **Fraud block** — blocklisted email rejected before any gateway call; saga compensates the inventory reservation.
+5. **Webhook handling** — valid signature accepted, replay deduplicated, tampered body rejected.
+6. **Reconciliation** — three discrepancies surfaced, on-call paged for `MISSING_GATEWAY`.
+7. **Log redaction** — `card 4111-1111-1111-1111 cvv: 999` becomes `card ************1111 cvv: [REDACTED_CVV]` in logs.
+
+```python
+# Excerpt from ecommerce_checkout_example.py — the saga that ties it together.
+async def checkout(ctx: CheckoutContext, *, simulate_shipment_failure: bool = False):
+    saga_ctx = {**ctx.__dict__, "simulate_shipment_failure": simulate_shipment_failure}
+
+    saga = Saga(name="checkout", log=saga_log, saga_id=f"saga_{ctx.order_id}")
+    saga.add_step("reserve_inventory", reserve_inventory, release_inventory)
+    saga.add_step("authorize_payment", authorize_payment, void_payment)
+    saga.add_step("capture_payment", capture_payment)
+    saga.add_step("create_shipment", create_shipment)
+
+    return await saga.execute(saga_ctx)
+```
+
+`authorize_payment` is the function that calls our hero — `charge_customer` with the six-decorator stack from Example 1 — which means every step inherits idempotency, circuit breaking, retry, rate limiting, latency tracking, and audit logging without the saga having to know about any of it. That is the payoff of the layering.
+
+## What is intentionally not in this package
+
+- **A concrete gateway client.** Use the Stripe / Adyen / Braintree SDK directly and adapt it to the `PaymentGateway` Protocol in `gateway.py`. Keeping the SDK out of this package avoids dragging network, retry, and credential management into a library that should be pure logic.
+- **Production stores.** `InMemoryIdempotencyStore`, `InMemoryDedupStore`, `InMemorySagaLog`, and `EphemeralTokenizer` are for tests and local dev. Production needs Redis-backed (or DB-backed) implementations of those Protocols. The interfaces are designed for that swap.
+- **PCI-scope-relevant code paths that touch raw PANs.** The package operates on tokens. The only place a PAN appears is the `EphemeralTokenizer` (test fixture) and the redaction patterns (which assume a PAN already escaped into a log line and need cleanup).
+
+## Production checklist
+
+Before deploying anything that calls real money:
+
+- [ ] Replace every `InMemory*` store with a durable backend (Redis SETNX + EXPIRE, or a DB table with a unique index).
+- [ ] Install `PCIRedactionFilter` on every log handler — including third-party libraries' handlers — at process startup, before any payment code runs.
+- [ ] Capture the raw HTTP body for webhook routes *before* JSON parsing middleware runs, or signature verification will fail.
+- [ ] Run reconciliation against T-1 data on a schedule. Page on `MISSING_GATEWAY` discrepancies; auto-replay missed webhooks for `MISSING_INTERNAL`.
+- [ ] Configure `@retry` to catch only `NetworkError` / `GatewayTimeoutError` / `RateLimitedError` — never `Exception`. Catching too broadly turns a card decline into three card declines.
+- [ ] Put a circuit breaker on every external dependency (gateway, fraud service, tokenization vault). The package's `@circuit_breaker` is per-process; for multi-instance deployments coordinate via a shared store.
+- [ ] Run quarterly ASV scans, annual penetration tests, and tabletop incident drills against the saga compensation flow specifically. The path you exercise least is the one that fails in production.
 
 ---
 
