@@ -1,0 +1,97 @@
+# pyproject.toml — modern Python packaging metadata.
+#
+# This file is the PEP 621 / PEP 517 standard format that has replaced
+# setup.py for new projects. You can keep setup.py around for backward
+# compatibility (or delete it once you're confident pyproject.toml works).
+#
+# Build with:    python -m build
+# Install dev:   pip install -e ".[dev]"
+# Upload:        twine upload dist/*
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prod-py-utils"
+version = "1.0.0"
+description = "Production-ready utilities for modern Python applications, including a payments subpackage."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Uddipan Bagchi", email = "uddipan.tweets@gmail.com" },
+]
+keywords = [
+    "utilities", "decorators", "async", "performance",
+    "validation", "dependency-injection", "patterns",
+    "payments", "idempotency", "saga", "webhooks",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Office/Business :: Financial",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "mypy>=1.0.0",
+    "flake8>=6.0.0",
+]
+performance = [
+    "prometheus-client>=0.16.0",
+]
+async = [
+    "aiohttp>=3.8.0",
+    "aiofiles>=23.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/UBags/python-utilities"
+Source = "https://github.com/UBags/python-utilities"
+"Bug Reports" = "https://github.com/UBags/python-utilities/issues"
+Documentation = "https://github.com/UBags/python-utilities#readme"
+
+# ---------------------------------------------------------------------------
+# Setuptools-specific configuration (replaces find_packages() in setup.py)
+# ---------------------------------------------------------------------------
+[tool.setuptools.packages.find]
+include = ["python_utilities*", "payments*"]
+exclude = ["tests*", "examples*"]
+
+# ---------------------------------------------------------------------------
+# Tool configuration co-located with packaging metadata.
+# Keeping these here means contributors find every config in one place.
+# ---------------------------------------------------------------------------
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312", "py313"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
