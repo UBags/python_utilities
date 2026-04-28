@@ -65,6 +65,9 @@ setup(
             "aiohttp>=3.8.0",
             "aiofiles>=23.0.0",
         ],
+        "settings": [
+            "pydantic-settings>=2.0.0",
+        ],
     },
     keywords=(
         "utilities decorators async performance validation "
