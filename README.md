@@ -24,6 +24,57 @@ https://github.com/UBags/python-utilities
 Built and maintained by [Uddipan Bagchi](https://github.com/UBags).
 ---
 
+[![PyPI version](https://img.shields.io/pypi/v/prod-py-utils.svg)](https://pypi.org/project/prod-py-utils/)
+[![Python versions](https://img.shields.io/pypi/pyversions/prod-py-utils.svg)](https://pypi.org/project/prod-py-utils/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+## Installation
+
+Install from PyPI:
+
+```bash
+pip install prod-py-utils
+```
+
+Verify the install:
+
+```bash
+python -c "import python_utilities, payments; print('OK')"
+```
+
+### Optional extras
+
+The base install includes only the core dependency (`pydantic`). Additional features live behind extras:
+
+```bash
+pip install "prod-py-utils[async]"              # aiohttp, aiofiles
+pip install "prod-py-utils[performance]"        # prometheus-client
+pip install "prod-py-utils[dev]"                # pytest, black, mypy, flake8
+pip install "prod-py-utils[async,performance]"  # combine multiple
+```
+
+### Requirements
+
+- Python 3.9 or higher
+- Pydantic 2.0 or higher (installed automatically)
+
+## Quick start
+
+The library exposes two top-level packages — general-purpose utilities and production payment primitives:
+
+```python
+# General-purpose utilities
+from python_utilities.decorators import retry, cached, circuit_breaker
+from python_utilities.patterns import EventBus, Repository
+
+# Production payment primitives
+from payments import idempotent, Saga, WebhookVerifier
+```
+
+See [Example 1](#example-1-bulletproof-payment-charging-the-headline-stack) below for the headline decorator stack that combines both.
+
+---
+
 ## 💡 Real-World Power Examples
 
 ### Example 1: Bulletproof Payment Charging (the headline stack)
